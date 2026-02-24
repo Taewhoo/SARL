@@ -1,0 +1,22 @@
+# @package environment.skyrl_gym
+# number of background workers for env step calls. Set to 0 to disable background workers.
+max_env_workers: 32
+
+text2sql:
+  db_path: "/home/ray/default/sql_data"
+
+llm_as_a_judge:
+  model: "gpt-4o-mini"
+  base_url: null  # or a local endpoint: http://localhost:8000/v1
+
+search:
+  log_requests: false
+  search_url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+  timeout: 30
+  feedback_model: "self"  # "self" or model name (e.g., "Qwen/Qwen3-235B-A22B-Instruct-2507")
+  feedback_url: null  # URL for external feedback model (e.g., "http://192.168.0.30:8080/v1")
+  mask_zero_format: true  # If true, mask loss and set reward=0 for invalid format; if false, train on invalid format (reward depends on enable_feedback_reward)
+  feedback_penalty: 0.8  # Penalty multiplier per feedback iteration: final_reward = r * a^(T-1), where T is number of feedbacks
+  enable_feedback_reward: false  # Enable trajectory-based feedback reward component: R_total = (r * a^(T-1)) + β * R_fb
+  feedback_coef: 0.5  # β: coefficient for feedback reward component

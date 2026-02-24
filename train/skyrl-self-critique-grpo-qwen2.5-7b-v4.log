@@ -1,0 +1,15 @@
+Using CPython 3.12.12
+Creating virtual environment at: .venv
+warning: The `extra-build-dependencies` option is experimental and may change without warning. Pass `--preview-features extra-build-dependencies` to disable this warning.
+   Building skyrl-train @ file:///mnt/vast/aigen/taewhoo/agents/SARL/train
+   Building skyrl-gym @ file:///mnt/vast/aigen/taewhoo/agents/SARL/train/skyrl-gym
+      Built skyrl-gym @ file:///mnt/vast/aigen/taewhoo/agents/SARL/train/skyrl-gym
+      Built skyrl-train @ file:///mnt/vast/aigen/taewhoo/agents/SARL/train
+warning: Failed to hardlink files; falling back to full copy. This may lead to degraded performance.
+         If the cache and target directories are on different filesystems, hardlinking may not be supported.
+         If this is intentional, set `export UV_LINK_MODE=copy` or use `--link-mode=copy` to suppress this warning.
+Installed 202 packages in 1m 48s
+no viable alternative at input 'path_to_hf_export_dir (e.g., {trainer.ckpt_path}'
+See https://hydra.cc/docs/1.2/advanced/override_grammar/basic for details
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
