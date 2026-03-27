@@ -119,6 +119,8 @@ class RayPPOTrainer:
         """
         self.train_dataloader = build_dataloader(self.cfg, self.train_dataset, is_train=True)
         self.total_training_steps = len(self.train_dataloader) * self.cfg.trainer.epochs
+        if self.cfg.trainer.get("steps") is not None:
+            self.total_training_steps = min(self.total_training_steps, self.cfg.trainer.steps)
 
     @torch.no_grad()
     async def eval(self) -> Dict[str, float]:
@@ -153,28 +155,31 @@ class RayPPOTrainer:
         """
         Main training loop for PPO
         """
-        # Initialize weight sync state between policy model and inference engines.
-        with Timer("init_weight_sync_state"):
-            self.init_weight_sync_state()
+        disable_train = self.cfg.trainer.get("disable_train", False)
 
-        # Load policy model to GPU before loading checkpoint.
-        if self.colocate_all:
-            self.policy_model.backload_to_gpu()
+        if not disable_train:
+            # Initialize weight sync state between policy model and inference engines.
+            with Timer("init_weight_sync_state"):
+                self.init_weight_sync_state()
 
-        # Load checkpoint state if resumption is enabled.
-        if self.resume_mode != ResumeMode.NONE:
-            with Timer("load_checkpoints"):
-                self.global_step, _ = self.load_checkpoints()
+            # Load policy model to GPU before loading checkpoint.
+            if self.colocate_all:
+                self.policy_model.backload_to_gpu()
 
-        if self.colocate_all:
-            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-            asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
-        with Timer("sync_weights"):
-            ray.get(self.sync_policy_weights_to_inference_engines())
-        if self.colocate_all:
-            with Timer("offload_policy_model_to_cpu"):
-                self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-            asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
+            # Load checkpoint state if resumption is enabled.
+            if self.resume_mode != ResumeMode.NONE:
+                with Timer("load_checkpoints"):
+                    self.global_step, _ = self.load_checkpoints()
+
+            if self.colocate_all:
+                self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+                asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
+            with Timer("sync_weights"):
+                ray.get(self.sync_policy_weights_to_inference_engines())
+            if self.colocate_all:
+                with Timer("offload_policy_model_to_cpu"):
+                    self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
+                asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
 
         # Eval before training
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
@@ -192,6 +197,19 @@ class RayPPOTrainer:
         self.global_step += 1  # start training at global_step 1
         for epoch in range(start_epoch, self.cfg.trainer.epochs):
             for iter, rand_prompts in enumerate(self.train_dataloader):
+                # ── Offline resume: skip steps whose shards already exist ─────
+                _offline_dir = os.environ.get("OFFLINE_DATASET_DIR", "")
+                if _offline_dir and self.cfg.trainer.get("disable_train", False):
+                    _shard_path = os.path.join(_offline_dir, "shards", f"step-{self.global_step:06d}-shard-0000")
+                    if os.path.isdir(_shard_path):
+                        logger.info(f"[offline_resume] Shard exists, skipping step {self.global_step}: {_shard_path}")
+                        pbar.update(1)
+                        self.global_step += 1
+                        if self.global_step > self.total_training_steps:
+                            break
+                        continue
+                # ── End offline resume ────────────────────────────────────────
+
                 with Timer("step", self.all_timings):
                     # for colocate_all=true, inference engine is always on GPU when starting the training step
 
@@ -245,11 +263,14 @@ class RayPPOTrainer:
                         logger.info(f"Number of sequences: {len(training_input['sequences'])}")
 
                     # 1.4 inference and calculate values, log probs, rewards, kl divergence
-                    with Timer("fwd_logprobs_values_reward", self.all_timings):
-                        training_input = self.fwd_logprobs_values_reward(training_input)
+                    # Skip when disable_train=true: logprobs are only needed for the
+                    # training loss and KL penalty, neither of which runs in that mode.
+                    if not self.cfg.trainer.get("disable_train", False):
+                        with Timer("fwd_logprobs_values_reward", self.all_timings):
+                            training_input = self.fwd_logprobs_values_reward(training_input)
 
                     # 1.5 apply kl divergence penalty to rewards
-                    if self.cfg.trainer.algorithm.use_kl_in_reward:
+                    if self.cfg.trainer.algorithm.use_kl_in_reward and not self.cfg.trainer.get("disable_train", False):
                         with Timer("apply_reward_kl_penalty", self.all_timings):
                             training_input = self.apply_reward_kl_penalty(training_input)
 
@@ -259,6 +280,26 @@ class RayPPOTrainer:
                         # remove some unwanted keys
                         for key in ["rewards"]:
                             training_input.pop(key)
+
+                        # ── Offline dataset hook ────────────────────────────────
+                        # Save pre-normalized advantages + trajectories for
+                        # torchtitan-rl offline GRPO training when
+                        # OFFLINE_DATASET_DIR env-var is set.
+                        _offline_dir = os.environ.get("OFFLINE_DATASET_DIR", "")
+                        if _offline_dir:
+                            from skyrl_train.utils.offline_dataset import save_batch_as_hf_dataset
+                            _uids = list(uids)
+                            save_batch_as_hf_dataset(
+                                generator_input=generator_input,
+                                generator_output=generator_output,
+                                training_input=training_input,
+                                uids=_uids,
+                                tokenizer=self.tokenizer,
+                                output_dir=_offline_dir,
+                                global_step=self.global_step,
+                            )
+                        # ── End offline dataset hook ────────────────────────────
+
                         training_input.metadata.pop("uids")
 
                     if self.cfg.trainer.algorithm.advantage_batch_normalize:
@@ -274,43 +315,47 @@ class RayPPOTrainer:
 
                 # 4. train policy/critic model
                 # Policy model is backloaded to GPU during training
-                with Timer("train_critic_and_policy", self.all_timings):
-                    status = self.train_critic_and_policy(training_input)
+                if self.cfg.trainer.get("disable_train", False):
+                    status = {}  # no-op: generation + advantage computation only
+                else:
+                    with Timer("train_critic_and_policy", self.all_timings):
+                        status = self.train_critic_and_policy(training_input)
 
-                # 5. conditionally save checkpoints and hf model
-                if self.cfg.trainer.ckpt_interval > 0 and (
-                    self.global_step % self.cfg.trainer.ckpt_interval == 0
-                    or self.global_step == self.total_training_steps
-                ):
-                    with Timer("save_checkpoints", self.all_timings):
-                        self.save_checkpoints()
-                if self.cfg.trainer.hf_save_interval > 0 and (
-                    self.global_step % self.cfg.trainer.hf_save_interval == 0
-                    or self.global_step == self.total_training_steps
-                ):
-                    with Timer("save_hf_model", self.all_timings):
-                        self.save_models()
+                if not disable_train:
+                    # 5. conditionally save checkpoints and hf model
+                    if self.cfg.trainer.ckpt_interval > 0 and (
+                        self.global_step % self.cfg.trainer.ckpt_interval == 0
+                        or self.global_step == self.total_training_steps
+                    ):
+                        with Timer("save_checkpoints", self.all_timings):
+                            self.save_checkpoints()
+                    if self.cfg.trainer.hf_save_interval > 0 and (
+                        self.global_step % self.cfg.trainer.hf_save_interval == 0
+                        or self.global_step == self.total_training_steps
+                    ):
+                        with Timer("save_hf_model", self.all_timings):
+                            self.save_models()
 
-                # 6. conditionally sync policy and ref at the end of the epoch
-                if (
-                    self.cfg.trainer.update_ref_every_epoch
-                    and self.ref_model is not None
-                    and iter == len(self.train_dataloader) - 1
-                    and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
-                ):
-                    with Timer("update_ref_with_policy", self.all_timings):
-                        self.update_ref_with_policy()
+                    # 6. conditionally sync policy and ref at the end of the epoch
+                    if (
+                        self.cfg.trainer.update_ref_every_epoch
+                        and self.ref_model is not None
+                        and iter == len(self.train_dataloader) - 1
+                        and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
+                    ):
+                        with Timer("update_ref_with_policy", self.all_timings):
+                            self.update_ref_with_policy()
 
-                # 7. sync weights to inference engines
-                if self.colocate_all:
-                    self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-                    asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
-                with Timer("sync_weights", self.all_timings):
-                    ray.get(self.sync_policy_weights_to_inference_engines())
-                if self.colocate_all:
-                    with Timer("offload_policy_model_to_cpu"):
-                        self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-                    asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
+                    # 7. sync weights to inference engines
+                    if self.colocate_all:
+                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+                        asyncio.run(self.inference_engine_client.wake_up(tags=["weights"]))
+                    with Timer("sync_weights", self.all_timings):
+                        ray.get(self.sync_policy_weights_to_inference_engines())
+                    if self.colocate_all:
+                        with Timer("offload_policy_model_to_cpu"):
+                            self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
+                        asyncio.run(self.inference_engine_client.wake_up(tags=["kv_cache"]))
 
                 # 8. set logs
                 logger.info(status)
@@ -339,18 +384,25 @@ class RayPPOTrainer:
 
                 del training_input, generator_output
 
+                if self.global_step > self.total_training_steps:
+                    break
+            else:
+                continue
+            break  # propagate inner break to outer epoch loop
+
         pbar.close()
-        if self.colocate_all:
-            asyncio.run(self.inference_engine_client.sleep())
-            self.policy_model.backload_to_gpu()
-        if self.cfg.trainer.ckpt_interval > 0:
-            with Timer("save_checkpoints", self.all_timings):
-                self.save_checkpoints()
-                logger.info("Saved final checkpoint.")
-        if self.cfg.trainer.hf_save_interval > 0:
-            with Timer("save_hf_model", self.all_timings):
-                self.save_models()
-                logger.info("Saved final model.")
+        if not disable_train:
+            if self.colocate_all:
+                asyncio.run(self.inference_engine_client.sleep())
+                self.policy_model.backload_to_gpu()
+            if self.cfg.trainer.ckpt_interval > 0:
+                with Timer("save_checkpoints", self.all_timings):
+                    self.save_checkpoints()
+                    logger.info("Saved final checkpoint.")
+            if self.cfg.trainer.hf_save_interval > 0:
+                with Timer("save_hf_model", self.all_timings):
+                    self.save_models()
+                    logger.info("Saved final model.")
         logger.info("Training done!")
 
     def _remove_tail_data(self, entries: List[Any]) -> List[Any]:
@@ -360,6 +412,10 @@ class RayPPOTrainer:
         training we care that the total number of samples is nicely splittable
         across the (combined) data-parallel size of all enabled models.
         """
+        if self.policy_model is None:
+            # disable_train=True: no data-parallel alignment needed, keep all entries.
+            return entries
+
         lcm_dp_size = self.policy_model.actor_infos[0].rank.dp_size
         if self.critic_model is not None:
             lcm_dp_size = math.lcm(lcm_dp_size, self.critic_model.actor_infos[0].rank.dp_size)
@@ -786,7 +842,7 @@ class RayPPOTrainer:
                 index=data.metadata["uids"],
                 adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
                 config=self.cfg.trainer.algorithm,
-                values=data["values"],
+                values=data.get("values", None),
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
@@ -845,6 +901,10 @@ class RayPPOTrainer:
     def pad_batch(self, training_input: TrainingInputBatch) -> TrainingInputBatch:
         """Pad the batch to be divisible by dp size"""
         import math
+
+        if self.policy_model is None:
+            # disable_train=True: no data-parallel padding needed.
+            return training_input
 
         dp_size = self.policy_model.actor_infos[0].rank.dp_size
         if self.critic_model is not None:
@@ -1250,9 +1310,32 @@ class RayPPOTrainer:
 
         logger.info(f"Successfully saved checkpoint for global_step_{self.global_step} to: {global_step_folder}")
 
+        # Clean up intermediate checkpoints: when we land on a 25-step boundary,
+        # remove any checkpoints from the preceding interval that are NOT on a
+        # 25-step boundary (i.e. the 5/10/15/20-step saves).
+        if self.global_step % 25 == 0:
+            self._cleanup_intermediate_checkpoints(keep_every=25)
+
         # Clean up old checkpoints after successful save
         with Timer("cleanup_old_checkpoints", self.all_timings):
             self._cleanup_old_checkpoints()
+
+    def _cleanup_intermediate_checkpoints(self, keep_every: int = 25):
+        """Remove checkpoint dirs whose step is NOT a multiple of *keep_every*."""
+        ckpt_root = self.cfg.trainer.ckpt_path
+        if not os.path.isdir(ckpt_root):
+            return
+        for name in sorted(os.listdir(ckpt_root)):
+            if not name.startswith("global_step_"):
+                continue
+            try:
+                step = int(name.split("_")[-1])
+            except ValueError:
+                continue
+            if step % keep_every != 0:
+                path = os.path.join(ckpt_root, name)
+                logger.info(f"Removing intermediate checkpoint: {path}")
+                shutil.rmtree(path, ignore_errors=True)
 
     def _cleanup_old_checkpoints(self):
         if not self._node_ids:

@@ -606,6 +606,11 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
         env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
 
+    # Forward NCCL/FlashInfer env vars so Ray workers (e.g. vLLM inference engines) see them.
+    for key in ("NCCL_IBEXT_DISABLE", "NCCL_IB_DISABLE", "NCCL_NVLS_ENABLE", "VLLM_ALLREDUCE_USE_SYMM_MEM", "FLASHINFER_JIT_DIR"):
+        if key in os.environ:
+            env_vars[key] = os.environ[key]
+
     return env_vars
 
 
@@ -657,7 +662,34 @@ def initialize_ray(cfg: DictConfig):
     from .ppo_utils import sync_registries
 
     env_vars = prepare_runtime_environment(cfg)
-    ray.init(runtime_env={"env_vars": env_vars})
+
+    # Exclude uv project files so that when Ray auto-uploads the working directory,
+    # the temp copy does NOT contain pyproject.toml/uv.lock. Without these files uv
+    # will not create a broken per-node .venv; instead workers use py_executable
+    # which points at the shared .venv on weka (with vllm properly installed).
+    excludes = [
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+        ".venv/",
+        "outputs/",
+        "train_data/",
+        "*.log",
+        "*.parquet",
+        "*.arrow",
+    ]
+    runtime_env = {"env_vars": env_vars, "excludes": excludes}
+
+    # When RAY_RUNTIME_ENV_HOOK is disabled (shared-filesystem setup), all nodes
+    # share the same weka mount — point workers at the shared .venv Python and
+    # add the project root to PYTHONPATH so they can import skyrl_train.
+    if not os.environ.get("RAY_RUNTIME_ENV_HOOK"):
+        runtime_env["py_executable"] = sys.executable
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        existing = env_vars.get("PYTHONPATH", "")
+        env_vars["PYTHONPATH"] = f"{project_root}:{existing}" if existing else project_root
+
+    ray.init(runtime_env=runtime_env)
 
     # create the named ray actors for the registries to make available to all workers
     sync_registries()

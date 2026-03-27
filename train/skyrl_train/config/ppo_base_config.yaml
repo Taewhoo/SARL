@@ -178,6 +178,7 @@ trainer:
   export_path: "${oc.env:HOME}/exports/" # Path for exported artifacts (HF models, debug dumps, etc.)
   bf16: true
   epochs: 1  # Number of passes over the full dataset
+  steps: null  # If set, cap training at this many steps (overrides full epoch length)
   update_epochs_per_batch: 1  # Number of gradient update passes over each train batch
   train_batch_size: 1024  # See `utils/utils.py::validate_batch_sizes` for train, mini, and micro batch size constraints.
   policy_mini_batch_size: 256
@@ -199,6 +200,7 @@ trainer:
   run_name: "test_run"
   logger: "wandb"
   dump_data_batch: false
+  disable_train: false  # If true, skip the backward pass and optimizer step entirely (generation + advantage computation only)
   dump_eval_results: true
 
   # YaRN:

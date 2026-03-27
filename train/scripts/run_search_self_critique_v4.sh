@@ -28,17 +28,22 @@ set -x
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RAY_RUNTIME_ENV_HOOK=ray._private.runtime_env.uv_runtime_env_hook.hook  # Use uv for Ray workers
-export WANDB_API_KEY="<your_wandb_api_key_here>"
+# Avoid NCCL NET/OFI "Couldn't open CQ" (RC -22); must be forwarded to Ray workers via utils.prepare_runtime_environment
+export NCCL_IBEXT_DISABLE=1
+# Per-job FlashInfer JIT dir to avoid stale cache from previous Ray sessions (ninja: ... session_* ... missing)
+export FLASHINFER_JIT_DIR="${FLASHINFER_JIT_DIR:-/tmp/flashinfer_jit_$$}"
+export WANDB_API_KEY="de8b3531e996caccab64ea27fd8113822bc379f5"
 
 WAND_PROJECT='NQ-HotpotQA-ASearcher-45k-clean'
-BASE_MODEL='Qwen/Qwen2.5-7B'
-# BASE_MODEL='Qwen/Qwen2.5-14B'
+# BASE_MODEL='Qwen/Qwen2.5-7B'
+BASE_MODEL='Qwen/Qwen2.5-14B'
 # BASE_MODEL='Qwen/Qwen2.5-7B-Instruct'
-EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-7b-v4'
-# EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-14b-v4'
+# EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-7b-v4'
+EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-14b-v4'
+# EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-7b-instruct-v4'
 
 # path for dataset (.parquet files) containing the prompts and metadata for each question
-DATA_DIR="path_to_train_data"
+DATA_DIR="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/train/train_data"
 
 # change environment.skyrl_gym.search.search_url to your own search server
 uv run --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
@@ -88,7 +93,7 @@ uv run --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   environment.env_class="search" \
   environment.skyrl_gym.max_env_workers=16 \
   environment.skyrl_gym.search.log_requests=false \
-  environment.skyrl_gym.search.search_url="http://192.168.0.5:8010/retrieve" \
+  environment.skyrl_gym.search.search_url="http://10.100.54.167:8010/retrieve" \
   environment.skyrl_gym.search.topk=3 \
   environment.skyrl_gym.search.feedback_model="self" \
   environment.skyrl_gym.search.feedback_url=null \
@@ -103,7 +108,7 @@ uv run --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.hf_save_interval=25 \
   trainer.max_ckpts_to_keep=999999 \
   trainer.resume_mode=latest \
-  trainer.ckpt_path="path_to_ckpt_save_dir" \
+  trainer.ckpt_path="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/ckpt_v4_qwen2.5-14b" \
   trainer.eval_batch_size=128 \
   trainer.eval_before_train=false \
   trainer.eval_interval=25 \
@@ -111,6 +116,6 @@ uv run --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.dump_eval_results=true \
   generator.eval_sampling_params.temperature=0 \
   generator.eval_sampling_params.stop='["</search>", "</answer>"]' \
-  trainer.export_path="path_to_hf_export_dir (e.g., {trainer.ckpt_path}/exports)" \
+  trainer.export_path="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/ckpt_v4_qwen2.5-14b/exports" \
   2>&1 | tee $EXPERIMENT_NAME.log
   

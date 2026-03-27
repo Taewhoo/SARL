@@ -53,6 +53,9 @@ class SearchEnv(BaseTextEnv):
         # Feedback reward: R_total = (r * penalty) + β * R_fb
         self.enable_feedback_reward = env_config.get("enable_feedback_reward", False)
         self.feedback_coef = env_config.get("feedback_coef", 0.5)
+
+        # Disable feedback loop entirely (Search-R1 style: no self-critique, episode ends on <answer>)
+        self.disable_feedback = env_config.get("disable_feedback", False)
         
         # Check if we're in evaluation mode (no feedback loop during eval)
         self.is_training = extras.get("is_training", True)
@@ -83,7 +86,7 @@ class SearchEnv(BaseTextEnv):
                 content = msg.get("content", "")
                 # Parse question from the formatted prompt using regex
                 question_pattern = re.compile(
-                    r"For example, <answer> Beijing </answer>. Question:\s*(.*?)(?:\s*$|<\|im_end\|>)",
+                    r"For example, <answer> Beijing </answer>. Question:\s*(.*)",
                     re.DOTALL
                 )
                 match = question_pattern.search(content)
@@ -288,11 +291,11 @@ Search Process:
             chat_history_str = "".join([item["content"] for item in self.chat_history])
             base_reward = compute_score(chat_history_str, self.ground_truth)
             
-            # During evaluation: use pure base reward (no penalties or feedback components)
-            # During training: apply feedback penalties and reward components
-            if not self.is_training:
+            # During evaluation or when feedback is disabled (Search-R1 style):
+            # use pure base reward (no penalties or feedback components)
+            if not self.is_training or self.disable_feedback:
                 final_reward = base_reward
-                logger.info(f"Eval reward - Base: {base_reward:.4f}, Feedbacks: {self.feedback_count}")
+                logger.info(f"{'Eval' if not self.is_training else 'No-feedback'} reward - Base: {base_reward:.4f}, Feedbacks: {self.feedback_count}")
                 return final_reward
             
             # Training reward calculation
@@ -352,11 +355,12 @@ Search Process:
         if self.turns >= self.max_turns:
             return True
         
-        # If answer is detected, don't end yet - we need feedback first
+        # If answer is detected, end immediately when feedback is disabled (Search-R1 style)
+        # Otherwise, don't end yet - we need feedback first
         # Note: Model often doesn't generate </answer>, so we only check for <answer>
         if "<answer>" in action:
-            return False
-        
+            return self.disable_feedback
+
         return False
 
     def _validate_action(self, action: str):

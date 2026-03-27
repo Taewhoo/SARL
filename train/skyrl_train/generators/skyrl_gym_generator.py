@@ -207,6 +207,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             self.base_conversation,
             add_generation_prompt=False,
             tokenize=True,
+            return_dict=False,
             **self.generator_cfg.chat_template_kwargs,
         )
         # We remove tokens after the last EOS token so that it can be captured in `observation_ids`.
@@ -298,8 +299,19 @@ class SkyRLGymGenerator(GeneratorInterface):
         chat_history = copy.deepcopy(prompt)
 
         # init() returns the first prompt to be given to the model, and optional metadata dict
-        chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
+        chat_history, init_metadata = await self._run_in_executor_if_available(env.init, chat_history)
         initial_chat_history_length = len(chat_history)
+
+        # Allow the env to inject tool definitions for the initial tokenization only (e.g. Solar Open).
+        # These are passed via the `_chat_template_tools` key in init() metadata and forwarded to
+        # apply_chat_template's `tools=` argument so the tokenizer's chat template renders the correct
+        # system section.  They are NOT applied to incremental observation tokenizations (base_conv
+        # approach), which is intentional: the tools section only appears once at the prompt start.
+        _init_tools = (init_metadata or {}).get("_chat_template_tools")
+        initial_template_kwargs = dict(self.generator_cfg.chat_template_kwargs)
+        if _init_tools:
+            initial_template_kwargs["tools"] = _init_tools
+
         initial_input_ids = self.tokenizer.apply_chat_template(
             chat_history,
             # If retokenize_chat_history==True, avoid including the generation prompt in both the
@@ -307,7 +319,8 @@ class SkyRLGymGenerator(GeneratorInterface):
             add_generation_prompt=not retokenize_chat_history,
             chat_template=self.custom_chat_template if retokenize_chat_history else None,
             tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
+            return_dict=False,
+            **initial_template_kwargs,
         )
 
         initial_prompt_length = len(initial_input_ids)
@@ -369,6 +382,13 @@ class SkyRLGymGenerator(GeneratorInterface):
                     "rollout_logprobs": agent_loop_state.rollout_logprobs.copy() if agent_loop_state.rollout_logprobs is not None else None,
                     "response_end_idx": agent_loop_state.response_end_idx,
                     "response_prefix": response_prefix,  # Save prefix for feedback generation
+                    # Environment-specific template for the revision instruction injected
+                    # after an INCOMPLETE feedback judgment.  Must have exactly one
+                    # positional placeholder: {feedback}.  Falls back to the default
+                    # search-R1 template when absent.
+                    "feedback_format_template": prev_env_step_output.get("metadata", {}).get(
+                        "feedback_format_template", None
+                    ),
                 }
                 
                 # Use only the observations from previous step (feedback prompt)
@@ -384,6 +404,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     obs_only_chat,
                     add_generation_prompt=True,
                     tokenize=True,
+                    return_dict=False,
                     **self.generator_cfg.chat_template_kwargs,
                 )
                 
@@ -408,6 +429,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     chat_template=self.custom_chat_template if retokenize_chat_history else None,
                     add_generation_prompt=True,
                     tokenize=True,
+                    return_dict=False,
                     **self.generator_cfg.chat_template_kwargs,
                 )
                 agent_loop_state.loss_mask = []
@@ -610,16 +632,23 @@ class SkyRLGymGenerator(GeneratorInterface):
                     # External feedback or no prefix: add the full feedback
                     feedback_trajectory.append({"role": "assistant", "content": full_feedback})
                 
-                # Format feedback with instruction for the model
-                formatted_feedback = f"\n\nFeedback:\n{full_feedback}\n\nNow, revise your search process based on the feedback above. You must first conduct reasoning inside <think> and </think>, discussing the validity of the given feedback. After reasoning, if you find you lack some knowledge, you can call a search engine by <search> query </search> and it will return the top searched results between <information> and </information>. You can search as many times as your want. If you find no further external knowledge needed, you can directly provide the answer inside <answer> and </answer>, without detailed illustrations. For example, <answer> Beijing </answer>. Reasoning:\n"
+                # Format feedback with instruction for the model.
+                # Use environment-supplied template if present (e.g. for tool-calling
+                # environments); otherwise fall back to the default search-R1 prompt.
+                _feedback_fmt_tpl = saved_state_for_feedback.get("feedback_format_template")
+                if _feedback_fmt_tpl:
+                    formatted_feedback = _feedback_fmt_tpl.replace("{feedback}", full_feedback)
+                else:
+                    formatted_feedback = f"\n\nFeedback:\n{full_feedback}\n\nNow, revise your search process based on the feedback above. You must first conduct reasoning inside <think> and </think>, discussing the validity of the given feedback. After reasoning, if you find you lack some knowledge, you can call a search engine by <search> query </search> and it will return the top searched results between <information> and </information>. You can search as many times as your want. If you find no further external knowledge needed, you can directly provide the answer inside <answer> and </answer>, without detailed illustrations. For example, <answer> Beijing </answer>. Reasoning:\n"
                 
                 if self.use_conversation_multi_turn:
                     # Multi-turn: add formatted feedback as a USER message to chat history
                     agent_loop_state.chat_history.append({"role": "user", "content": formatted_feedback})
                     
-                    # Reset loss_mask so it gets computed from chat_history
+                    # Reset loss_mask so it gets recomputed from chat_history at the end
                     agent_loop_state.loss_mask = []
                     agent_loop_state.rollout_logprobs = None
+                    need_loss_mask_recompute = True
                     
                     # If episode continues (feedback was INCOMPLETE), update input_ids for next iteration
                     if not agent_loop_state.done:
@@ -627,6 +656,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                             agent_loop_state.chat_history,
                             add_generation_prompt=True,
                             tokenize=True,
+                            return_dict=False,
                             **self.generator_cfg.chat_template_kwargs,
                         )
                 else:
@@ -832,6 +862,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     [*self.base_conversation, *new_obs],
                     add_generation_prompt=not is_done,
                     tokenize=True,
+                    return_dict=False,
                     **self.generator_cfg.chat_template_kwargs,
                 )[len(self.base_conversation_token_ids) :]
             elif not is_done:
@@ -944,6 +975,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             init_prompts,
             add_generation_prompt=True,
             tokenize=True,
+            return_dict=False,
         )
         rollout_metrics = get_rollout_metrics(responses, rewards, env_metrics, env_classes)
 

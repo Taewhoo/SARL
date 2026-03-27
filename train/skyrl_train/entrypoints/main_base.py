@@ -129,6 +129,15 @@ class BasePPOExp:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        # Optionally override the tokenizer's chat template (e.g. apply the
+        # Instruct chat template to a base model that ships without one).
+        template_file = self.cfg.trainer.get("tokenizer_chat_template_file", None)
+        if template_file:
+            with open(template_file, "r") as f:
+                tokenizer.chat_template = f.read()
+            logger.info(f"Loaded chat template from {template_file}")
+
         return tokenizer
 
     def get_train_dataset(self):
@@ -290,8 +299,9 @@ class BasePPOExp:
             colocate_pg=self.colocate_pg,
         )
 
-        # Build the models
-        trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
+        # Build the models (skip when disable_train=True — generation-only mode needs no FSDP workers)
+        if not self.cfg.trainer.get("disable_train", False):
+            trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
         return trainer
 
     def run(self):
