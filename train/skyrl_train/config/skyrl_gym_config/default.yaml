@@ -20,6 +20,8 @@ search:
   feedback_penalty: 0.8  # Penalty multiplier per feedback iteration: final_reward = r * a^(T-1), where T is number of feedbacks
   enable_feedback_reward: false  # Enable trajectory-based feedback reward component: R_total = (r * a^(T-1)) + β * R_fb
   feedback_coef: 0.5  # β: coefficient for feedback reward component
+  random_feedback: false  # Ablation: replace model self-assessment with random COMPLETE/INCOMPLETE + generic feedback
+  random_feedback_rate: 0.5  # P(INCOMPLETE) when random_feedback=true
   tool_call_format: "qwen"  # "qwen" (<tool_call> XML) or "solar" (<|tool_call:begin|> tags)
 
 # search_tool_calling uses the same server config as search.

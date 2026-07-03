@@ -858,13 +858,23 @@ class SkyRLGymGenerator(GeneratorInterface):
             if len(new_obs) > 0:
                 # For Qwen, this will generate `\n<|user|>Some observation<|im_end|>\n`. Note that the
                 # first `\n` is generated since we stripped it in ``base_conversation_token_ids``.
-                obs_ids_to_add = self.tokenizer.apply_chat_template(
-                    [*self.base_conversation, *new_obs],
-                    add_generation_prompt=not is_done,
-                    tokenize=True,
-                    return_dict=False,
-                    **self.generator_cfg.chat_template_kwargs,
-                )[len(self.base_conversation_token_ids) :]
+                try:
+                    obs_ids_to_add = self.tokenizer.apply_chat_template(
+                        [*self.base_conversation, *new_obs],
+                        add_generation_prompt=not is_done,
+                        tokenize=True,
+                        return_dict=False,
+                        **self.generator_cfg.chat_template_kwargs,
+                    )[len(self.base_conversation_token_ids) :]
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).error(
+                        f"apply_chat_template failed: {e}\n"
+                        f"base_conversation: {self.base_conversation}\n"
+                        f"new_obs roles: {[m.get('role') for m in new_obs]}\n"
+                        f"new_obs content[:100]: {[m.get('content','')[:100] for m in new_obs]}"
+                    )
+                    raise
             elif not is_done:
                 obs_ids_to_add = self.generation_prompt_ids
         else:

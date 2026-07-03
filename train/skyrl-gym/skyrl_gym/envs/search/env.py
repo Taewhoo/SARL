@@ -3,6 +3,7 @@ from typing import Any
 from skyrl_gym.envs.search.utils import compute_score
 from skyrl_gym.tools import SearchToolGroup
 import re
+import random
 from typing import Dict, Optional, List
 from omegaconf import DictConfig
 import logging
@@ -56,6 +57,12 @@ class SearchEnv(BaseTextEnv):
 
         # Disable feedback loop entirely (Search-R1 style: no self-critique, episode ends on <answer>)
         self.disable_feedback = env_config.get("disable_feedback", False)
+
+        # Random feedback ablation: replace model self-assessment with random COMPLETE/INCOMPLETE
+        # at a fixed rate, with generic feedback content. Tests whether model's ability to identify
+        # and correct erroneous trajectories from a separate context is meaningful.
+        self.random_feedback = env_config.get("random_feedback", False)
+        self.random_feedback_rate = env_config.get("random_feedback_rate", 0.5)  # P(INCOMPLETE)
         
         # Check if we're in evaluation mode (no feedback loop during eval)
         self.is_training = extras.get("is_training", True)
@@ -464,37 +471,99 @@ Search Process:
                     f"First answer captured - Correctness: {self.first_answer_correctness}, "
                     f"Reward: {first_answer_reward:.4f}"
                 )
-            
+
+            # Random feedback ablation: skip model self-assessment, use random judgment
+            if self.random_feedback:
+                self.feedback_count += 1
+                is_incomplete = random.random() < self.random_feedback_rate
+
+                if is_incomplete:
+                    # Generic revision prompt — no constraint analysis, no specific guidance
+                    formatted_feedback = (
+                        "\n\nFeedback: The search process is INCOMPLETE."
+                        "\n\nNow, revise your search process based on the feedback above. "
+                        "You must first conduct reasoning inside <think> and </think>, "
+                        "discussing the validity of the given feedback. After reasoning, "
+                        "if you find you lack some knowledge, you can call a search engine "
+                        "by <search> query </search> and it will return the top searched "
+                        "results between <information> and </information>. You can search "
+                        "as many times as your want. If you find no further external "
+                        "knowledge needed, you can directly provide the answer inside "
+                        "<answer> and </answer>, without detailed illustrations. For "
+                        "example, <answer> Beijing </answer>. Reasoning:\n"
+                    )
+                    new_obs = {"role": "user", "content": formatted_feedback}
+                    self.chat_history.append(new_obs)
+
+                    logger.info(
+                        f"Random feedback - INCOMPLETE (rate={self.random_feedback_rate}), "
+                        f"feedback_count={self.feedback_count}"
+                    )
+
+                    return BaseTextEnvStepOutput(
+                        observations=[new_obs],
+                        reward=0,
+                        done=False,
+                        metadata={
+                            "feedback_incomplete": True,
+                            "random_feedback": True,
+                            "total_feedbacks": self.feedback_count,
+                        }
+                    )
+                else:
+                    # COMPLETE — end episode
+                    done = True
+                    reward = self._get_reward(action, done)
+
+                    logger.info(
+                        f"Random feedback - COMPLETE (rate={self.random_feedback_rate}), "
+                        f"feedback_count={self.feedback_count}"
+                    )
+
+                    return BaseTextEnvStepOutput(
+                        observations=[],
+                        reward=reward,
+                        done=True,
+                        metadata={
+                            "feedback_incomplete": False,
+                            "random_feedback": True,
+                            "total_feedbacks": self.feedback_count,
+                        }
+                    )
+
+            # Normal self-assessment flow
             # Set flag to indicate we're now waiting for feedback
             self.awaiting_feedback = True
             self.last_answer_turn = self.turns
-            
+
             # Generate feedback prompt - return it as observations so model generates feedback
             # But DON'T add it to chat_history (it's a separate generation process)
             # The model will only see this prompt, not the full chat history
             feedback_prompt = self._get_feedback_prompt()
-            
-            system_msg = {"role": "system", "content": "You are a careful and strict evaluator of search processes."}
-            user_msg = {"role": "user", "content": feedback_prompt}
-            
-            # Return observations so generator uses ONLY the feedback prompt for next generation
-            # Don't add to chat_history - we'll add the formatted feedback response later
-            # Metadata flag signals that generator should use ONLY these observations (not full chat_history)
-            metadata = {
-                "awaiting_feedback": True, 
-                "answer_turn": self.last_answer_turn,
-                "use_only_observations": True,  # Signal to generator to use only observations, not full chat_history
-                # No response_prefix_for_revision - let the model generate freely after feedback
-                "feedback_model": self.feedback_model,  # "self" or "external"
-                "feedback_url": self.feedback_url,  # URL for external feedback model
+
+            # Embed evaluator role in user message — some models (e.g. Qwen3.5)
+            # require system messages only at the start of the conversation.
+            user_msg = {
+                "role": "user",
+                "content": (
+                    "You are a careful and strict evaluator of search processes.\n\n"
+                    + feedback_prompt
+                ),
             }
-            
-            # Only use response prefix for self-feedback, not external feedback
+
+            metadata = {
+                "awaiting_feedback": True,
+                "answer_turn": self.last_answer_turn,
+                "use_only_observations": True,
+                "feedback_model": self.feedback_model,
+                "feedback_url": self.feedback_url,
+            }
+
             if self.feedback_model == "self":
-                metadata["response_prefix"] = "1. Essential Constraint(s):\n"  # Force feedback generation to start with this format
-            
+                metadata["response_prefix"] = "1. Essential Constraint(s):\n"
+
             return BaseTextEnvStepOutput(
-                observations=[system_msg, user_msg],
+                observations=[user_msg],
                 reward=0,  # No reward yet, episode not done
                 done=False,
                 metadata=metadata

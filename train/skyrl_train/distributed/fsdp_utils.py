@@ -16,8 +16,11 @@
 # limitations under the License.
 
 import functools
+import logging
 from contextlib import nullcontext
 from typing import Union
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.distributed as dist
@@ -116,9 +119,12 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
-            else:
-                transformer_cls_to_wrap.add(transformer_cls)
+                logger.warning(f"FSDP wrap: layer class '{layer_class}' not found in model, skipping.")
+                continue
+            transformer_cls_to_wrap.add(transformer_cls)
+
+        if not transformer_cls_to_wrap:
+            raise Exception("Could not find any transformer layer class to wrap in the model.")
 
         transformer_policy = functools.partial(
             transformer_auto_wrap_policy,
@@ -365,6 +371,8 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
     if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
         fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
+    elif isinstance(fsdp_transformer_layer_cls_to_wrap, set):
+        fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
 
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 

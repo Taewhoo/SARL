@@ -12,16 +12,33 @@ import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ErrorResponse,
-    CompletionRequest,
-    CompletionResponse,
-)
+try:
+    # vLLM >= 0.18.0
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+    )
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+    from vllm.entrypoints.openai.completion.protocol import (
+        CompletionRequest,
+        CompletionResponse,
+    )
+except ImportError:
+    # vLLM <= 0.11.x
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+    from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+    from vllm.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ErrorResponse,
+        CompletionRequest,
+        CompletionResponse,
+    )
 from vllm.lora.request import LoRARequest
 from uuid import uuid4
 import warnings
@@ -364,28 +381,71 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         model_name = model_path
 
         base_model_paths = [BaseModelPath(name=model_name, model_path=model_path)]
-        models = OpenAIServingModels(engine, model_config, base_model_paths)
-        # TODO(Charlie): revisit kwargs `enable_auto_tools` and `tool_parser` when we need to
-        # support OAI-style tool calling; and `request_logger` for better debugging.
-        self.openai_serving_chat = OpenAIServingChat(
-            engine_client=engine,
-            model_config=model_config,
-            models=models,
-            response_role="assistant",
-            request_logger=None,
-            chat_template=None,
-            chat_template_content_format="auto",
-            **openai_kwargs,
-        )
 
-        # TODO(Charlie): revisit kwargs `return_tokens_as_token_ids`,
-        # `enable_prompt_tokens_details`, `enable_force_include_usage`.
-        self.openai_serving_completion = OpenAIServingCompletion(
-            engine_client=engine,
-            model_config=model_config,
-            models=models,
-            request_logger=None,
-        )
+        if version.parse(vllm.__version__) >= version.parse("0.18.0"):
+            # vLLM 0.18.0+: OpenAIServingModels no longer takes engine as first arg,
+            # and OpenAIServingChat/Completion require openai_serving_render.
+            from vllm.entrypoints.openai.models.serving import OpenAIModelRegistry
+            from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+            from vllm.renderers import renderer_from_config
+            from vllm.plugins.io_processors import get_io_processor
+
+            vllm_config = engine.vllm_config
+            model_registry = OpenAIModelRegistry(
+                model_config=model_config,
+                base_model_paths=base_model_paths,
+            )
+            renderer = renderer_from_config(vllm_config)
+            io_processor = get_io_processor(
+                vllm_config, renderer, model_config.io_processor_plugin
+            )
+            render_kwargs = {k: v for k, v in openai_kwargs.items() if k != "reasoning_parser"}
+            openai_serving_render = OpenAIServingRender(
+                model_config=model_config,
+                renderer=renderer,
+                io_processor=io_processor,
+                model_registry=model_registry,
+                request_logger=None,
+                chat_template=None,
+                chat_template_content_format="auto",
+                **render_kwargs,
+            )
+            models = model_registry
+            self.openai_serving_chat = OpenAIServingChat(
+                engine_client=engine,
+                models=models,
+                response_role="assistant",
+                openai_serving_render=openai_serving_render,
+                request_logger=None,
+                chat_template=None,
+                chat_template_content_format="auto",
+                **openai_kwargs,
+            )
+            self.openai_serving_completion = OpenAIServingCompletion(
+                engine_client=engine,
+                models=models,
+                openai_serving_render=openai_serving_render,
+                request_logger=None,
+            )
+        else:
+            # vLLM <= 0.11.x
+            models = OpenAIServingModels(engine, model_config, base_model_paths)
+            self.openai_serving_chat = OpenAIServingChat(
+                engine_client=engine,
+                model_config=model_config,
+                models=models,
+                response_role="assistant",
+                request_logger=None,
+                chat_template=None,
+                chat_template_content_format="auto",
+                **openai_kwargs,
+            )
+            self.openai_serving_completion = OpenAIServingCompletion(
+                engine_client=engine,
+                model_config=model_config,
+                models=models,
+                request_logger=None,
+            )
         return engine
 
     async def _load_lora_from_disk(self, lora_path: str):
@@ -513,7 +573,10 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             assert request.stream is False, "Streaming is not supported in SkyRL yet, please set stream to False."
         except Exception as e:
             if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-                from vllm.entrypoints.openai.protocol import ErrorInfo
+                try:
+                    from vllm.entrypoints.openai.engine.protocol import ErrorInfo
+                except ImportError:
+                    from vllm.entrypoints.openai.protocol import ErrorInfo
 
                 return ErrorResponse(
                     error=ErrorInfo(
@@ -544,7 +607,10 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         except Exception as e:
             # Handle it here so we can surface the error from a ray worker.
             if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-                from vllm.entrypoints.openai.protocol import ErrorInfo
+                try:
+                    from vllm.entrypoints.openai.engine.protocol import ErrorInfo
+                except ImportError:
+                    from vllm.entrypoints.openai.protocol import ErrorInfo
 
                 return ErrorResponse(
                     error=ErrorInfo(

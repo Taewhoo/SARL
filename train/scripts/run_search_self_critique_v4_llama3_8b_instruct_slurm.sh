@@ -9,8 +9,8 @@ RETRIEVER_PORT=8010
 sbatch <<EOF
 #!/bin/bash
 #SBATCH --job-name=solar-open-sarl
-#SBATCH --partition=omni
-#SBATCH --nodelist=Slurm-GPU-Node-[75-90]
+#SBATCH --partition=normal
+#SBATCH --nodelist=Slurm-GPU-Node-[1-49]
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --mem=0

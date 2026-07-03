@@ -73,11 +73,11 @@ WAND_PROJECT='NQ-HotpotQA-ASearcher-45k-clean'
 # BASE_MODEL='Qwen/Qwen2.5-7B'
 # BASE_MODEL='Qwen/Qwen2.5-14B'
 # BASE_MODEL='Qwen/Qwen2.5-7B-Instruct'
-BASE_MODEL='Qwen/Qwen2.5-32B'
+BASE_MODEL='Qwen/Qwen2.5-7B'
 # EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-7b-v4'
 # EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-14b-v4'
 # EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-7b-instruct-v4'
-EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-32b-v4'
+EXPERIMENT_NAME='skyrl-self-critique-grpo-qwen2.5-7b-v4'
 
 DATA_DIR="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/train/train_data"
 
@@ -250,7 +250,7 @@ uv run --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.hf_save_interval=25 \
   trainer.max_ckpts_to_keep=999999 \
   trainer.resume_mode=latest \
-  trainer.ckpt_path="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/ckpt_v4_qwen2.5-32b" \
+  trainer.ckpt_path="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/ckpt_v4_qwen2.5-7b" \
   trainer.eval_batch_size=128 \
   trainer.eval_before_train=false \
   trainer.eval_interval=25 \
@@ -258,5 +258,5 @@ uv run --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.dump_eval_results=true \
   generator.eval_sampling_params.temperature=0 \
   generator.eval_sampling_params.stop='["</search>", "</answer>"]' \
-  trainer.export_path="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/ckpt_v4_qwen2.5-32b/exports" \
+  trainer.export_path="/mnt/weka/post_training_tmp/pt2-search-agent/SARL/ckpt_v4_qwen2.5-7b/exports" \
   2>&1 | tee $EXPERIMENT_NAME.log

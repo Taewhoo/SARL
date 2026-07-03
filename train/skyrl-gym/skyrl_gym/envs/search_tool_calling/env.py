@@ -4,8 +4,12 @@ Tool-calling search environment for SARL training.
 Unlike SearchEnv (search-R1 style), the model is given two explicit tools and
 returns structured tool calls instead of XML <search>/<answer> tags:
 
-  - local_knowledge_base_retrieval(user_query: str)
-  - get_document(docid: str)
+  - search(query: str)     — search the knowledge base
+  - browse(url: str)       — retrieve full document text
+
+Tool names and descriptions match snapshot-po Solar Open 100B (search_bench.py).
+Legacy names (local_knowledge_base_retrieval, get_document) are also accepted
+in model output for backward compatibility.
 
 The episode ends when the model emits a response **without** a tool-call block
 (i.e. a final answer). All reward and self-critique feedback logic from SearchEnv
@@ -16,7 +20,7 @@ Training configuration notes:
   - Set stop token per format:
       Qwen:  generator.sampling_params.stop='["</tool_call>"]'
       Solar: generator.sampling_params.stop='["<|tool_call:end|>"]'
-  - Set environment.skyrl_gym.search.tool_call_format="solar" for Solar Open 100B.
+  - Set environment.skyrl_gym.search_tool_calling.tool_call_format="solar" for Solar Open 100B.
   - The environment injects the tool system prompt and reformats the user message
     during init(), so the upstream dataset format is unchanged.
 """
@@ -43,8 +47,8 @@ logger = logging.getLogger(__name__)
 # Prompt templates — Qwen format
 # ---------------------------------------------------------------------------
 
-# Qwen-native tool-calling system prompt format.
-# Baked into the system message so no tokenizer-level tool handling is required.
+# Qwen-native tool-calling system prompt.
+# Uses search/browse tool names matching snapshot-po Solar Open 100B.
 _TOOL_SYSTEM_PROMPT = """\
 # Tools
 
@@ -52,8 +56,8 @@ You may call one or more functions to assist with the user request.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{"type": "function", "function": {"name": "local_knowledge_base_retrieval", "description": "Search the local knowledge base for documents relevant to the query. Returns the top results with their docids and text snippets.", "parameters": {"type": "object", "properties": {"user_query": {"type": "string", "description": "Query to search the local knowledge base for relevant information"}}, "required": ["user_query"], "additionalProperties": false}}}
-{"type": "function", "function": {"name": "get_document", "description": "Retrieve the full text of a document by its docid.", "parameters": {"type": "object", "properties": {"docid": {"type": "string", "description": "Document ID or URL to retrieve the full text for"}}, "required": ["docid"], "additionalProperties": false}}}
+{"type": "function", "function": {"name": "search", "description": "Search the local knowledge base for documents relevant to the query. Returns the top results with their URLs and text snippets.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Query to search the local knowledge base for relevant information"}}, "required": ["query"], "additionalProperties": false}}}
+{"type": "function", "function": {"name": "browse", "description": "Retrieve the full text of a document by its URL.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "Document URL to retrieve"}}, "required": ["url"], "additionalProperties": false}}}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -77,84 +81,65 @@ SOLAR_TOOL_DEFS = [
     {
         "type": "function",
         "function": {
-            "name": "local_knowledge_base_retrieval",
+            "name": "search",
             "description": (
                 "Search the local knowledge base for documents relevant to the query. "
-                "Returns the top results with their docids and text snippets."
+                "Returns the top results with their URLs and text snippets."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "user_query": {
+                    "query": {
                         "type": "string",
                         "description": "Query to search the local knowledge base for relevant information",
                     }
                 },
-                "required": ["user_query"],
+                "required": ["query"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "get_document",
-            "description": "Retrieve the full text of a document by its URL (used as docid).",
+            "name": "browse",
+            "description": "Retrieve the full text of a document by its URL.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "docid": {
+                    "url": {
                         "type": "string",
                         "description": "Document URL to retrieve",
                     }
                 },
-                "required": ["docid"],
+                "required": ["url"],
             },
         },
     },
 ]
 
-# User-message template for Solar Open — matches QUERY_TEMPLATE in oss_eval_async_clean.py exactly.
-_SOLAR_QUERY_TEMPLATE = (
+# User-message template — matches snapshot-po Solar Open 100B QUERY_TEMPLATE.
+_USER_PROMPT_TEMPLATE = (
     "You are a deep research agent. You need to answer the given question by interacting "
-    "with a search engine, using the search and get_document tools provided. Please perform "
+    "with a search engine, using the search and browse tools provided. Please perform "
     "reasoning and use the tools step by step, in an interleaved manner. You may use the "
-    "search and get_document tools multiple times.\n\n"
+    "search and browse tools multiple times.\n\n"
     "Question: {question}\n\n"
     "Your response should be in the following format:\n"
     "Explanation: {{your explanation for your final answer.}}\n"
     "Exact Answer: {{your succinct, final answer}}"
 )
 
-_USER_PROMPT_TEMPLATE = """\
-{question}
+# Alias for Solar Open tokenizer path (tool_call_format="solar").
+_SOLAR_QUERY_TEMPLATE = _USER_PROMPT_TEMPLATE
 
-Your final response should be in this format:
-Explanation: {{your explanation for your final answer}}
-Exact Answer: {{your succinct, final answer}}\
-"""
-
-# Injected into the chat history (as a user message) after an INCOMPLETE feedback.
-# {feedback} is replaced with the full feedback text generated by the feedback model.
-_FEEDBACK_FORMAT_TEMPLATE = (
-    "\n\nFeedback:\n{feedback}\n\n"
-    "Now, revise your research process based on the feedback above. "
-    "You must first perform reasoning, discussing the validity of the given feedback. "
-    "After reasoning, use the local_knowledge_base_retrieval and get_document tools to "
-    "gather more information. You may search as many times as you want. "
-    "If you find no further external knowledge needed, you can directly provide "
-    "your final answer in the format:\n"
-    "Explanation: {explanation_placeholder}\n"
-    "Exact Answer: {answer_placeholder}"
-)
-
-# Literal template string sent to the generator so it can do .replace("{feedback}", ...).
-# We keep {your explanation} and {your succinct final answer} as literal text
-# (not Python format fields) so the generator only needs to fill in {feedback}.
+# Injected into chat history (as a user message) after an INCOMPLETE feedback.
+# {feedback} is the only format field; the rest are literal instructions.
+# Matches snapshot-po Solar Open 100B: FEEDBACK_FORMAT_TEMPLATE in search_bench.py.
 FEEDBACK_FORMAT_TEMPLATE_FOR_GENERATOR = (
     "\n\nFeedback:\n{feedback}\n\n"
     "Now, revise your research process based on the feedback above. "
     "You must first perform reasoning, discussing the validity of the given feedback. "
-    "After reasoning, use the local_knowledge_base_retrieval and get_document tools to "
+    "After reasoning, use the search and browse tools to "
     "gather more information. You may search as many times as you want. "
     "If you find no further external knowledge needed, you can directly provide "
     "your final answer in the format:\n"
@@ -299,7 +284,7 @@ class SearchToolCallingEnv(BaseTextEnv):
 
     def _execute_search(self, query: str) -> str:
         """
-        Execute local_knowledge_base_retrieval and return JSON result list.
+        Execute search tool and return JSON result list.
 
         Returns a JSON array: [{"docid": str, "score": float|null, "snippet": str}, ...]
         """
@@ -422,12 +407,18 @@ class SearchToolCallingEnv(BaseTextEnv):
 
     def _get_feedback_prompt(self) -> str:
         """Build the self-critique evaluation prompt (adapted for tool calls)."""
-        # Extract question from the user message in the rebuilt prompt
+        # Extract question from the user message in the rebuilt prompt.
+        # The user prompt is: "...Question: {question}\n\nYour response should be..."
         question = ""
         for msg in self.chat_history:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
-                # Tool-calling user message: "question\n\nYour final response..."
+                # Try "Question: {question}" pattern first (Solar-style prompt)
+                m = re.search(r"Question:\s*(.*?)(?:\n\nYour response|\Z)", content, re.DOTALL)
+                if m:
+                    question = m.group(1).strip()
+                    break
+                # Fallback: everything before "\n\nYour final response"
                 m = re.match(r"^(.*?)(?:\n\nYour final response|\Z)", content, re.DOTALL)
                 if m:
                     question = m.group(1).strip()
@@ -445,11 +436,11 @@ class SearchToolCallingEnv(BaseTextEnv):
         search_process = f"Question: {question}\nReasoning: {reasoning}"
 
         eval_prompt = (
-            "The following is a research process where the agent uses tool calls "
-            "to gather information.\n"
-            "Your task is to judge the integrity of the research process itself, "
+            "The following is a search process that uses tool calls to reason and collect "
+            "evidence.\n"
+            "Your task is to judge the integrity of the search process itself, "
             "NOT whether the final answer is correct.\n\n"
-            "A research process has integrity only if it demonstrates that all information "
+            "A search process has integrity only if it demonstrates that all information "
             "required to answer the question was systematically and transparently sought "
             "before committing to a conclusion.\n\n"
             "Evaluate the process using the criteria below.\n\n"
@@ -478,24 +469,26 @@ class SearchToolCallingEnv(BaseTextEnv):
             "   - List each essential constraint implied by the question as short, minimal, "
             "concrete items.\n"
             "   - Do NOT include any additional constraint that is not directly derived from "
-            "the question.\n\n"
+            "the question. The provided search process must not affect the construction of "
+            "the essential constraint(s).\n\n"
             "2. Analysis:\n"
-            "   - Analyze the integrity of the research process based on the criteria above.\n"
-            "   - Analyze whether the research process attempted to resolve each essential "
+            "   - Analyze the integrity of the search process based on the criteria defined "
+            "above.\n"
+            "   - Analyze whether the search process attempted to resolve each essential "
             "constraint before committing to an answer.\n\n"
             "3. Judgment:\n"
             "   - Output exactly one word: COMPLETE or INCOMPLETE\n\n"
             "--------------------------------\n"
             "Important Restrictions\n"
             "--------------------------------\n\n"
-            "- Focus solely on the integrity of the research process.\n"
-            "- DO NOT perform any tool calls yourself.\n"
+            "- Focus solely on the integrity of the search process.\n"
+            "- DO NOT perform any searches yourself.\n"
             "- DO NOT answer the question.\n"
-            "- DO NOT assume facts not explicitly supported by the research process.\n"
+            "- DO NOT assume facts that are not explicitly supported by the search process.\n"
             "- If there is reasonable doubt that all essential constraints were properly "
             "addressed, you MUST choose INCOMPLETE.\n\n"
             "--------------------------------\n"
-            "Research Process:\n"
+            "Search Process:\n"
             "--------------------------------\n\n"
             "{search_process}"
         )
@@ -702,11 +695,15 @@ class SearchToolCallingEnv(BaseTextEnv):
             self.last_answer_turn = self.turns
 
             feedback_prompt = self._get_feedback_prompt()
-            system_msg = {
-                "role": "system",
-                "content": "You are a careful and strict evaluator of research processes.",
+            # Embed evaluator role in user message — Qwen3.5 (and similar models)
+            # require system messages only at the start of the conversation.
+            user_msg = {
+                "role": "user",
+                "content": (
+                    "You are a careful and strict evaluator of research processes.\n\n"
+                    + feedback_prompt
+                ),
             }
-            user_msg = {"role": "user", "content": feedback_prompt}
 
             metadata: Dict[str, Any] = {
                 "awaiting_feedback": True,
@@ -722,7 +719,7 @@ class SearchToolCallingEnv(BaseTextEnv):
                 metadata["response_prefix"] = "1. Essential Constraint(s):\n"
 
             return BaseTextEnvStepOutput(
-                observations=[system_msg, user_msg],
+                observations=[user_msg],
                 reward=0.0,
                 done=False,
                 metadata=metadata,
@@ -749,10 +746,10 @@ class SearchToolCallingEnv(BaseTextEnv):
                         return v
             return str(val) if val else ""
 
-        if tool_name == "local_knowledge_base_retrieval":
-            result = self._execute_search(_arg_str("user_query"))
-        elif tool_name == "get_document":
-            result = self._execute_get_document(_arg_str("docid"))
+        if tool_name in ("search", "local_knowledge_base_retrieval"):
+            result = self._execute_search(_arg_str("query") or _arg_str("user_query"))
+        elif tool_name in ("browse", "get_document"):
+            result = self._execute_get_document(_arg_str("url") or _arg_str("docid"))
         else:
             result = json.dumps({"error": f"Unknown tool: {tool_name!r}"})
 
