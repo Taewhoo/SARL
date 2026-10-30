@@ -1,0 +1,39 @@
+# @package environment.skyrl_gym
+# number of background workers for env step calls. Set to 0 to disable background workers.
+max_env_workers: 32
+
+text2sql:
+  db_path: "/home/ray/default/sql_data"
+
+llm_as_a_judge:
+  model: "gpt-4o-mini"
+  base_url: null  # or a local endpoint: http://localhost:8000/v1
+
+search:
+  log_requests: false
+  search_url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+  timeout: 30
+  feedback_model: "self"  # "self" or model name (e.g., "Qwen/Qwen3-235B-A22B-Instruct-2507")
+  feedback_url: null  # URL for external feedback model (e.g., "http://<feedback_server_host>:8080/v1")
+  mask_zero_format: true  # If true, mask loss and set reward=0 for invalid format; if false, train on invalid format (reward depends on enable_feedback_reward)
+  feedback_penalty: 0.8  # Penalty multiplier per feedback iteration: final_reward = r * a^(T-1), where T is number of feedbacks
+  enable_feedback_reward: false  # Enable trajectory-based feedback reward component: R_total = (r * a^(T-1)) + β * R_fb
+  feedback_coef: 0.5  # β: coefficient for feedback reward component
+  tool_call_format: "qwen"  # "qwen" (<tool_call> XML) or "solar" (<|tool_call:begin|> tags)
+
+# search_tool_calling uses the same server config as search.
+# The generator looks up config by env_class name, so this section must be named
+# "search_tool_calling" to match environment.env_class=search_tool_calling.
+search_tool_calling:
+  log_requests: false
+  search_url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+  timeout: 30
+  feedback_model: "self"
+  feedback_url: null
+  mask_zero_format: true
+  feedback_penalty: 0.8
+  enable_feedback_reward: false
+  feedback_coef: 0.5
+  tool_call_format: "qwen"
